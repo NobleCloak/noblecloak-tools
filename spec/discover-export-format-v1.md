@@ -31,7 +31,7 @@ nullable.
 |---|---|---|---|
 | `kind` | string | no | Always the literal `"discover-export"`. |
 | `version` | string | no | Always the literal `"1"` for this spec version. |
-| `vendor` | string | no | `"google"` or `"entra"` — a closed enum. This intentionally mirrors the `auditConnectorEnum` pinned in `bianoble-discover/packages/discover-db/src/schema/scans.ts`; adding a vendor here requires updating both. |
+| `vendor` | string | no | `"google"` or `"entra"` — a closed enum. This intentionally mirrors the connector enumeration the Discover service pins; adding a vendor here requires updating both. |
 | `generatedAt` | string | no | ISO-8601 UTC timestamp, e.g. `"2026-08-17T12:00:00Z"`, taken when the export script finished writing. |
 | `pseudonymized` | boolean | no | `true` unless the operator explicitly opted out (`--no-pseudonymize` / `-NoPseudonymize`). |
 | `hashAlgo` | string | no | Always the literal `"hmac-sha256"`, **even when `pseudonymized` is `false`** — it documents which algorithm *would* be used, keeping the header shape constant across both modes. |
