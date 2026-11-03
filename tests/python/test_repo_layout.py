@@ -38,7 +38,7 @@ class TestRepoLayout(unittest.TestCase):
         self.assertIn("Privacy model", readme)
         self.assertIn("Quick start", readme)
         self.assertIn("docs.noblecloak.com", readme)
-        self.assertIn("GitHub org: bianoble", readme)
+        self.assertIn("GitHub org: NobleCloak", readme)
 
 
 if __name__ == "__main__":

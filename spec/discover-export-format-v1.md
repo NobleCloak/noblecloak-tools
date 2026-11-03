@@ -1,8 +1,8 @@
 # Discover Export Format (DEF) v1
 
 DEF is the interchange format produced by `nc-export.py` and
-`nc-export-entra.ps1` and consumed by NobleCloak Discover
-(`bianoble-discover`). It is deliberately small, vendor-agnostic, and
+`nc-export-entra.ps1` and consumed by NobleCloak Discover. It is
+deliberately small, vendor-agnostic, and
 line-delimited so it can be produced offline from an admin console export
 with no SDKs beyond each language's standard library.
 
@@ -182,5 +182,5 @@ of the NDJSON file shape:
 ## Vendor enum
 
 `vendor` is a closed enum: `"google"` and `"entra"` only, matching
-`auditConnectorEnum` in `bianoble-discover`. This is enforced by every
+the Discover service's connector enumeration. This is enforced by every
 implementation and by `tests/python/def_validator.py`.

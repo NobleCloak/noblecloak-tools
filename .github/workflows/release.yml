@@ -9,8 +9,8 @@ name: release
 # required workflow's most recent run against this commit's SHA and fails
 # the release job unless all three concluded "success". No code-signing
 # (out of scope for this epic); integrity is SHA-256 checksums published
-# in the release notes and as a sidecar file, so a consumer (e.g.
-# bianoble-discover) can verify what they pinned against.
+# in the release notes and as a sidecar file, so a consumer (the Discover
+# ingestion path, say) can verify what they pinned against.
 
 on:
   push:

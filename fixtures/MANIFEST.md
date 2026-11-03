@@ -45,7 +45,7 @@ are checked against — see `tests/python/test_fixture_parity_*.py`,
 Fixtures are versioned in lockstep with the DEF spec: a spec change that
 alters output shape requires regenerating every golden file in the same
 change, and bumping both version markers together. Consumers outside this
-repo (e.g. `bianoble-discover`'s ingestion path) that pin against these
+repo (the Discover ingestion path, say) that pin against these
 fixtures should pin against a released tag — see the repo's `release.yml`
 workflow, which publishes a SHA-256 checksum of `spec/discover-export-format-v1.md`
 alongside each tagged release so a fixture-set/spec mismatch is detectable

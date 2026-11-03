@@ -6,7 +6,7 @@ Microsoft Entra ID OAuth-grant inventory into the [Discover Export Format
 file you hand to [NobleCloak Discover](https://docs.noblecloak.com) for
 shadow-AI and third-party-app risk analysis.
 
-GitHub org: bianoble
+GitHub org: NobleCloak
 
 ## Privacy model
 
