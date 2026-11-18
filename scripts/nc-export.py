@@ -86,6 +86,10 @@ GOOGLE_CONSOLE_EVENT_COLUMN = "OAuth event"
 # counted in skippedRows either.
 GOOGLE_GRANT_EVENT = "Authorize"
 GOOGLE_USERS_REQUIRED_COLUMNS = ["email"]
+# The Admin console's Directory > Users > Download users CSV names the
+# primary address "Email Address [Required]". Only that column counts:
+# recovery and secondary addresses are not directory users.
+GOOGLE_CONSOLE_USERS_EMAIL_COLUMN = "Email Address [Required]"
 
 OWNER_ONLY_MODE = stat.S_IRUSR | stat.S_IWUSR  # 0600
 
@@ -514,9 +518,15 @@ def parse_entra_triplet(
 
 
 def parse_google_users_csv(path: str) -> int:
-    """Return the distinct user count from a Google Users CSV."""
+    """Return the distinct user count from a Google Users CSV.
+
+    Accepts a CSV with an `email` column, or the Admin console's Users
+    download as is (primary address in "Email Address [Required]"). Every
+    row is a directory user whatever its status, so a suspended account is
+    counted. A UTF-8 byte order mark on the header is ignored.
+    """
     try:
-        fh = open(path, "r", encoding="utf-8", newline="")
+        fh = open(path, "r", encoding="utf-8-sig", newline="")
     except OSError as exc:
         raise ExportError(f"cannot open users CSV '{path}': {exc}") from exc
 
@@ -525,13 +535,23 @@ def parse_google_users_csv(path: str) -> int:
         if reader.fieldnames is None:
             raise ExportError(f"users CSV '{path}' has no header row")
 
-        missing = [c for c in GOOGLE_USERS_REQUIRED_COLUMNS if c not in reader.fieldnames]
-        if missing:
+        fieldnames = list(reader.fieldnames)
+        if all(c in fieldnames for c in GOOGLE_USERS_REQUIRED_COLUMNS):
+            email_column = "email"
+        elif GOOGLE_CONSOLE_USERS_EMAIL_COLUMN in fieldnames:
+            email_column = GOOGLE_CONSOLE_USERS_EMAIL_COLUMN
+        else:
             raise ExportError(
-                f"users CSV '{path}' is missing required column(s): {', '.join(missing)}"
+                f"users CSV '{path}' is missing required column(s): {', '.join(GOOGLE_USERS_REQUIRED_COLUMNS)} "
+                f"(or, as an Admin console Users download: '{GOOGLE_CONSOLE_USERS_EMAIL_COLUMN}'); "
+                f"expected 'email' or '{GOOGLE_CONSOLE_USERS_EMAIL_COLUMN}'"
             )
 
-        emails = {normalize_email(row["email"]) for row in reader if row.get("email")}
+        emails = {
+            normalize_email(row[email_column])
+            for row in reader
+            if (row.get(email_column) or "").strip()
+        }
         return len(emails)
 
 

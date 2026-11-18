@@ -187,6 +187,81 @@ class TestGoogleConsoleExport(unittest.TestCase):
         self.assertFalse(self.out_dir.exists())
 
 
+# Header row of the Admin console's Directory > Users > Download users >
+# "All user info columns" > CSV, exactly as written on 2026-11-18.
+CONSOLE_USERS_HEADER = (
+    "First Name [Required],Last Name [Required],Email Address [Required],Password [Required],"
+    "Password Hash Function [UPLOAD ONLY],Org Unit Path [Required],New Primary Email [UPLOAD ONLY],"
+    "Status [READ ONLY],Last Sign In [READ ONLY],Recovery Email,Home Secondary Email,Work Secondary Email\n"
+)
+
+
+def console_user(email, status="Active", recovery=""):
+    return f"A,B,{email},****,,/,,{status},Never logged in,{recovery},,\n"
+
+
+class TestGoogleConsoleUsersDownload(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = pathlib.Path(self._tmp.name)
+        self.out_dir = self.tmp / "out"
+        self.audit = self.tmp / "api.csv"
+        self.audit.write_text(
+            API_HEADER + "2026-01-05T10:00:00Z,alice@example.com,111-aaa.apps.googleusercontent.com,Slack,openid\n",
+            encoding="utf-8",
+        )
+
+    def _export(self, users: pathlib.Path):
+        return run(
+            ["google", "--audit-csv", str(self.audit), "--users-csv", str(users), "--out-dir", str(self.out_dir)],
+            cwd=self.tmp,
+        )
+
+    def _header(self):
+        first = (self.out_dir / "discover-export.ndjson").read_text(encoding="utf-8").splitlines()[0]
+        return json.loads(first)
+
+    def test_console_users_download_counts_every_directory_user(self):
+        users = self.tmp / "users.csv"
+        users.write_text(
+            CONSOLE_USERS_HEADER
+            + console_user("alice@example.com", recovery="alice.home@example.org")
+            + console_user("Bob@Example.com")
+            + console_user("bob@example.com")  # same user, different case
+            + console_user("carol@example.com", status="Suspended"),
+            encoding="utf-8",
+        )
+        result = self._export(users)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # A suspended account is still a directory user; a recovery address is not a user.
+        self.assertEqual(self._header()["userCountTotal"], 3)
+
+    def test_users_csv_with_bom_is_accepted_in_both_layouts(self):
+        # The `email` layout is the one a BOM breaks: there the email column is
+        # the first header, so an unstripped BOM renames it to "﻿email".
+        for name, content in (
+            ("api", "email\nalice@example.com\n"),
+            ("console", CONSOLE_USERS_HEADER + console_user("alice@example.com")),
+        ):
+            with self.subTest(layout=name):
+                users = self.tmp / f"users-{name}.csv"
+                users.write_bytes(b"\xef\xbb\xbf" + content.encode("utf-8"))
+                self.out_dir = self.tmp / f"out-{name}"
+                result = self._export(users)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self._header()["userCountTotal"], 1)
+
+    def test_users_csv_without_an_email_column_names_both_accepted_headers(self):
+        users = self.tmp / "users.csv"
+        users.write_text("Date,Event status,User,Event\n2026-01-05T10:00:00Z,,alice@example.com,Login\n", encoding="utf-8")
+        result = self._export(users)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("'email'", result.stderr)
+        self.assertIn("Email Address [Required]", result.stderr)
+        self.assertFalse(self.out_dir.exists())
+
+
 class TestGoogleExportWindow(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

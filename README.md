@@ -51,8 +51,11 @@ Full format details: [`spec/discover-export-format-v1.md`](spec/discover-export-
    (`Date`, `App ID`, `App name`, `User`, `Scope`, `OAuth event`) and its
    `", "`-separated scopes. A Reports API export with the columns
    `time, actorEmail, clientId, displayText, scopes` works too.
-   Optionally, also have a **Users** CSV with an `email` column for an
-   accurate `userCountTotal`.
+   Optionally, also download **Directory > Users > Download users > All
+   user info columns > CSV** for an accurate `userCountTotal`. Pass it as
+   downloaded: the script counts the distinct `Email Address [Required]`
+   values (suspended accounts included; recovery and secondary addresses
+   are not users). A CSV with an `email` column works too.
 2. Run:
 
    ```sh
