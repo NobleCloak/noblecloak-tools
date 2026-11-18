@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import stat
 import sys
@@ -67,7 +68,28 @@ GOOGLE_AUDIT_REQUIRED_COLUMNS = ["time", "actorEmail", "clientId", "displayText"
 # grant.scopes "May be empty" -- an empty scopes cell is valid input, not a
 # malformed row, and must not be skipped the way a missing actorEmail is.
 GOOGLE_AUDIT_REQUIRED_NONEMPTY_COLUMNS = ["time", "actorEmail", "clientId", "displayText"]
+
+# The Admin console's own download (Reporting > Audit and investigation >
+# OAuth log events > Download > CSV) names the same fields differently, and
+# also carries an "OAuth event" column. Maps each canonical column above to
+# its console header.
+GOOGLE_CONSOLE_COLUMNS = {
+    "time": "Date",
+    "actorEmail": "User",
+    "clientId": "App ID",
+    "displayText": "App name",
+    "scopes": "Scope",
+}
+GOOGLE_CONSOLE_EVENT_COLUMN = "OAuth event"
+# Only an Authorize event is evidence of a grant. Every other event (e.g.
+# Revoke) is left out of the export: it is not a grant row, so it is not
+# counted in skippedRows either.
+GOOGLE_GRANT_EVENT = "Authorize"
 GOOGLE_USERS_REQUIRED_COLUMNS = ["email"]
+# The Admin console's Directory > Users > Download users CSV names the
+# primary address "Email Address [Required]". Only that column counts:
+# recovery and secondary addresses are not directory users.
+GOOGLE_CONSOLE_USERS_EMAIL_COLUMN = "Email Address [Required]"
 
 OWNER_ONLY_MODE = stat.S_IRUSR | stat.S_IWUSR  # 0600
 
@@ -97,7 +119,7 @@ def derive_user_ref(salt_bytes: bytes, email: str, pseudonymized: bool) -> str:
     return "user_" + digest[:16]
 
 
-def dedupe_grants(raw_grants: list[dict]) -> list[dict]:
+def dedupe_grants(raw_grants: list[dict], time_key=None) -> list[dict]:
     """Collapse raw (event-level) grant rows into one entry per (email, clientId) --
     or, for an "AllPrincipals" row (no associated user), per clientId alone.
 
@@ -109,6 +131,11 @@ def dedupe_grants(raw_grants: list[dict]) -> list[dict]:
     sorted, `firstSeen`/`lastUsed` reduced to min/max of the non-null
     values seen. A "Principal" row and an "AllPrincipals" row for the same
     clientId are never merged with each other -- they key differently.
+
+    `time_key` orders the firstSeen/lastUsed values. None compares the
+    strings ordinally, which is what nc-export-entra.ps1 does
+    ([string]::CompareOrdinal), so the Entra path keeps it for byte-identical
+    parity. The Google path passes utc_instant_key, which compares instants.
     """
     grouped: dict[tuple[str, str], dict] = {}
     for raw in raw_grants:
@@ -132,12 +159,14 @@ def dedupe_grants(raw_grants: list[dict]) -> list[dict]:
 
         entry["scopes"].update(raw["scopes"])
 
+        key = time_key or (lambda v: v)
+
         first_seen = raw.get("firstSeen")
-        if first_seen is not None and (entry["firstSeen"] is None or first_seen < entry["firstSeen"]):
+        if first_seen is not None and (entry["firstSeen"] is None or key(first_seen) < key(entry["firstSeen"])):
             entry["firstSeen"] = first_seen
 
         last_used = raw.get("lastUsed")
-        if last_used is not None and (entry["lastUsed"] is None or last_used > entry["lastUsed"]):
+        if last_used is not None and (entry["lastUsed"] is None or key(last_used) > key(entry["lastUsed"])):
             entry["lastUsed"] = last_used
 
     return list(grouped.values())
@@ -178,16 +207,126 @@ def dump_line(obj: dict, keys: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def parse_google_audit_csv(path: str) -> tuple[list[dict], list[str]]:
+def _google_audit_layout(path: str, fieldnames: list[str]) -> tuple[dict[str, str], Optional[str]]:
+    """Pick the column layout of a Google audit CSV from its header row.
+
+    Returns (columns, event_column): `columns` maps each canonical column
+    name to the header that holds it in this file, and `event_column` names
+    the column holding the OAuth event type whenever the header has one
+    (in either layout), or None. Raises ExportError naming both accepted layouts when the header
+    matches neither.
+    """
+    present = set(fieldnames)
+    # Filter on the event column whenever it is there, whichever layout
+    # matched: a header carrying both layouts must not turn a Revoke into a grant.
+    event_column = GOOGLE_CONSOLE_EVENT_COLUMN if GOOGLE_CONSOLE_EVENT_COLUMN in present else None
+    if all(c in present for c in GOOGLE_AUDIT_REQUIRED_COLUMNS):
+        return {c: c for c in GOOGLE_AUDIT_REQUIRED_COLUMNS}, event_column
+
+    console_required = list(GOOGLE_CONSOLE_COLUMNS.values()) + [GOOGLE_CONSOLE_EVENT_COLUMN]
+    if all(c in present for c in console_required):
+        return dict(GOOGLE_CONSOLE_COLUMNS), GOOGLE_CONSOLE_EVENT_COLUMN
+
+    missing_api = [c for c in GOOGLE_AUDIT_REQUIRED_COLUMNS if c not in present]
+    missing_console = [c for c in console_required if c not in present]
+    raise ExportError(
+        f"audit CSV '{path}' is missing required column(s): {', '.join(missing_api)} "
+        f"(Reports API columns: {', '.join(GOOGLE_AUDIT_REQUIRED_COLUMNS)}); "
+        f"as an Admin console download it is missing: {', '.join(missing_console)} "
+        f"(console columns: {', '.join(console_required)})"
+    )
+
+
+# re.ASCII: Python's \d also matches non-ASCII digits (e.g. fullwidth), which
+# Discover's JavaScript check does not. Matched with fullmatch, never `$`
+# (which also matches before a trailing newline).
+_UTC_Z_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z", re.ASCII)
+_OFFSET_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2})", re.ASCII)
+
+
+def _parse_whole_seconds(whole: str):
+    """Calendar-check YYYY-MM-DDTHH:MM:SS; returns a naive datetime or None."""
+    import datetime
+
+    try:
+        return datetime.datetime.strptime(whole, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+
+
+def utc_instant_key(value: str):
+    """Ordering key for a UTC `Z` timestamp: (whole seconds, fraction).
+
+    Comparing the strings themselves is wrong when fractional lengths differ
+    ("...00.5Z" sorts before "...00Z" because '.' < 'Z'). Only called on
+    values to_utc_z produced, so the match cannot fail.
+    """
+    from decimal import Decimal
+
+    match = _UTC_Z_RE.fullmatch(value)
+    whole, fraction = match.groups()
+    return (_parse_whole_seconds(whole), Decimal("0" + (fraction or "")))
+
+
+def to_utc_z(value: str) -> Optional[str]:
+    """Return `value` as an ISO-8601 UTC timestamp ending in `Z`, or None.
+
+    DEF timestamps are UTC with a `Z` suffix (the Discover intake refuses
+    anything else). A value already in that form is returned unchanged, byte
+    for byte. A value with a numeric offset (the Admin console writes local
+    time, e.g. `2026-11-18T14:08:23-05:00`) is shifted to UTC, and its
+    fractional-second digits are kept exactly as written. Anything else (no
+    offset, not ISO-8601) returns None: the instant is unknown, so it is not
+    guessed.
+    """
+    import datetime
+
+    value = value.strip()
+    z_match = _UTC_Z_RE.fullmatch(value)
+    if z_match is not None:
+        return value if _parse_whole_seconds(z_match.group(1)) is not None else None
+    match = _OFFSET_TS_RE.fullmatch(value)
+    if match is None:
+        return None
+    whole, fraction, offset = match.groups()
+    if _parse_whole_seconds(whole) is None:
+        return None
+    try:
+        local = datetime.datetime.fromisoformat(whole + offset)
+        utc = local.astimezone(datetime.timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+    # isoformat zero-pads the year (strftime("%Y") does not on glibc before 1000).
+    return utc.replace(tzinfo=None).isoformat(timespec="seconds") + (fraction or "") + "Z"
+
+
+def _split_scopes(value: str) -> list[str]:
+    """Split a scopes cell on spaces and/or commas.
+
+    The Reports API joins scopes with a space and the Admin console download
+    joins them with ", ". An OAuth scope token never contains either
+    character (RFC 6749 section 3.3), so splitting on both is lossless.
+    """
+    return [s for s in re.split(r"[,\s]+", value) if s]
+
+
+def parse_google_audit_csv(path: str) -> tuple[list[dict], list[str], int]:
     """Parse a Google OAuth Token Audit CSV.
 
-    Returns (raw_grants, warnings). Raises ExportError for a missing
-    required column or a completely empty (headerless) file. A row with a
-    missing, explicit-empty, or whitespace-only required value is skipped
-    with a warning rather than raising.
+    Accepts either the Reports API column names (`time, actorEmail,
+    clientId, displayText, scopes`) or the Admin console's OAuth log events
+    download, as downloaded (see GOOGLE_CONSOLE_COLUMNS). A UTF-8 byte order
+    mark on the header is ignored.
+
+    Returns (raw_grants, warnings, ignored_events). Raises ExportError for a
+    header that matches neither layout or a completely empty (headerless)
+    file. A row with a missing, explicit-empty, or whitespace-only required
+    value is skipped with a warning rather than raising. In the console
+    layout, a row whose OAuth event is not Authorize is not a grant: it is
+    left out and counted in `ignored_events`, not in `warnings`.
     """
     try:
-        fh = open(path, "r", encoding="utf-8", newline="")
+        fh = open(path, "r", encoding="utf-8-sig", newline="")
     except OSError as exc:
         raise ExportError(f"cannot open audit CSV '{path}': {exc}") from exc
 
@@ -196,18 +335,19 @@ def parse_google_audit_csv(path: str) -> tuple[list[dict], list[str]]:
         if reader.fieldnames is None:
             raise ExportError(f"audit CSV '{path}' has no header row")
 
-        missing = [c for c in GOOGLE_AUDIT_REQUIRED_COLUMNS if c not in reader.fieldnames]
-        if missing:
-            raise ExportError(
-                f"audit CSV '{path}' is missing required column(s): {', '.join(missing)}"
-            )
+        columns, event_column = _google_audit_layout(path, list(reader.fieldnames))
 
         raw_grants: list[dict] = []
         warnings: list[str] = []
+        ignored_events = 0
         for row_number, row in enumerate(reader, start=2):  # header is line 1
-            values = {col: row.get(col) for col in GOOGLE_AUDIT_REQUIRED_COLUMNS}
+            if event_column is not None and (row.get(event_column) or "").strip() != GOOGLE_GRANT_EVENT:
+                ignored_events += 1
+                continue
+
+            values = {col: row.get(header) for col, header in columns.items()}
             missing_values = [
-                col
+                columns[col]
                 for col in GOOGLE_AUDIT_REQUIRED_NONEMPTY_COLUMNS
                 if (values.get(col) or "").strip() == ""
             ]
@@ -218,8 +358,15 @@ def parse_google_audit_csv(path: str) -> tuple[list[dict], list[str]]:
                 )
                 continue
 
-            scopes_value = values.get("scopes") or ""
-            scopes = [s for s in scopes_value.split(" ") if s]
+            time_utc = to_utc_z(values["time"])
+            if time_utc is None:
+                warnings.append(
+                    f"skipping malformed row {row_number} in '{path}': "
+                    f"{columns['time']} is not an ISO-8601 timestamp with a UTC offset"
+                )
+                continue
+
+            scopes = _split_scopes(values.get("scopes") or "")
             raw_grants.append(
                 {
                     "email": values["actorEmail"],
@@ -227,12 +374,12 @@ def parse_google_audit_csv(path: str) -> tuple[list[dict], list[str]]:
                     "appDisplayName": values["displayText"],
                     "consentType": "Principal",
                     "scopes": scopes,
-                    "firstSeen": values["time"],
-                    "lastUsed": values["time"],
+                    "firstSeen": time_utc,
+                    "lastUsed": time_utc,
                 }
             )
 
-        return raw_grants, warnings
+        return raw_grants, warnings, ignored_events
 
 
 def _read_json(path: str) -> dict:
@@ -452,9 +599,15 @@ def parse_entra_triplet(
 
 
 def parse_google_users_csv(path: str) -> int:
-    """Return the distinct user count from a Google Users CSV."""
+    """Return the distinct user count from a Google Users CSV.
+
+    Accepts a CSV with an `email` column, or the Admin console's Users
+    download as is (primary address in "Email Address [Required]"). Every
+    row is a directory user whatever its status, so a suspended account is
+    counted. A UTF-8 byte order mark on the header is ignored.
+    """
     try:
-        fh = open(path, "r", encoding="utf-8", newline="")
+        fh = open(path, "r", encoding="utf-8-sig", newline="")
     except OSError as exc:
         raise ExportError(f"cannot open users CSV '{path}': {exc}") from exc
 
@@ -463,13 +616,23 @@ def parse_google_users_csv(path: str) -> int:
         if reader.fieldnames is None:
             raise ExportError(f"users CSV '{path}' has no header row")
 
-        missing = [c for c in GOOGLE_USERS_REQUIRED_COLUMNS if c not in reader.fieldnames]
-        if missing:
+        fieldnames = list(reader.fieldnames)
+        if all(c in fieldnames for c in GOOGLE_USERS_REQUIRED_COLUMNS):
+            email_column = "email"
+        elif GOOGLE_CONSOLE_USERS_EMAIL_COLUMN in fieldnames:
+            email_column = GOOGLE_CONSOLE_USERS_EMAIL_COLUMN
+        else:
             raise ExportError(
-                f"users CSV '{path}' is missing required column(s): {', '.join(missing)}"
+                f"users CSV '{path}' is missing required column(s): {', '.join(GOOGLE_USERS_REQUIRED_COLUMNS)} "
+                f"(or, as an Admin console Users download: '{GOOGLE_CONSOLE_USERS_EMAIL_COLUMN}'); "
+                f"expected 'email' or '{GOOGLE_CONSOLE_USERS_EMAIL_COLUMN}'"
             )
 
-        emails = {normalize_email(row["email"]) for row in reader if row.get("email")}
+        emails = {
+            normalize_email(row[email_column])
+            for row in reader
+            if (row.get(email_column) or "").strip()
+        }
         return len(emails)
 
 
@@ -547,6 +710,16 @@ def write_outputs(
         os.chmod(mapping_path, OWNER_ONLY_MODE)
 
 
+def _resolve_generated_at(override: Optional[str]) -> str:
+    """The header's generatedAt: now, or the test-only --generated-at override in UTC."""
+    if override is None:
+        return _generated_at()
+    resolved = to_utc_z(override)
+    if resolved is None:
+        raise ExportError(f"--generated-at '{override}' is not an ISO-8601 timestamp with a UTC offset")
+    return resolved
+
+
 def _generated_at() -> str:
     import datetime
 
@@ -577,10 +750,51 @@ def _warn_if_empty_result(user_count_total: Optional[int], grant_objects: list[d
 # ---------------------------------------------------------------------------
 
 
+def _parse_window_bound(flag: str, value: str):
+    import datetime
+
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ExportError(f"{flag} '{value}' is not an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ExportError(f"{flag} '{value}' needs a UTC offset (e.g. 'Z' or '-05:00')")
+    return parsed
+
+
+def resolve_export_window(start: Optional[str], end: Optional[str]) -> Optional[dict]:
+    """Build the header's exportWindow from the operator's --export-window-* flags.
+
+    The spec forbids guessing the window, so it is only ever what the
+    operator states: both flags (the date range they chose in the console),
+    written in UTC (see to_utc_z), or neither (null). Raises ExportError for
+    one flag without the other, a timestamp that is not ISO-8601 with an
+    offset, or a start after the end.
+    """
+    if start is None and end is None:
+        return None
+    if start is None or end is None:
+        raise ExportError("--export-window-start and --export-window-end must be given both or neither")
+    if _parse_window_bound("--export-window-start", start) > _parse_window_bound("--export-window-end", end):
+        raise ExportError(f"--export-window-start '{start}' is after --export-window-end '{end}'")
+    start_utc, end_utc = to_utc_z(start), to_utc_z(end)
+    if start_utc is None or end_utc is None:
+        raise ExportError("--export-window-start / --export-window-end must be YYYY-MM-DDTHH:MM:SS with an offset")
+    return {"start": start_utc, "end": end_utc}
+
+
 def run_google(args: argparse.Namespace) -> None:
-    raw_grants, warnings = parse_google_audit_csv(args.audit_csv)
+    export_window = resolve_export_window(args.export_window_start, args.export_window_end)
+
+    raw_grants, warnings, ignored_events = parse_google_audit_csv(args.audit_csv)
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
+    if ignored_events:
+        print(
+            f"note: left out {ignored_events} non-Authorize event row(s) (e.g. Revoke); "
+            "they are not grants and are not counted as skipped",
+            file=sys.stderr,
+        )
 
     user_count_total = None
     if args.users_csv is not None:
@@ -589,7 +803,7 @@ def run_google(args: argparse.Namespace) -> None:
     pseudonymized = not args.no_pseudonymize
     salt_bytes = load_or_generate_salt(args.salt_file) if pseudonymized else b""
 
-    grouped = dedupe_grants(raw_grants)
+    grouped = dedupe_grants(raw_grants, time_key=utc_instant_key)
     grant_objects = build_grant_objects(grouped, salt_bytes, pseudonymized)
 
     _warn_if_empty_result(user_count_total, grant_objects)
@@ -600,10 +814,10 @@ def run_google(args: argparse.Namespace) -> None:
         script_name="nc-export.py",
         pseudonymized=pseudonymized,
         user_count_total=user_count_total,
-        export_window=None,
+        export_window=export_window,
         grant_objects=grant_objects,
         salt_bytes=salt_bytes,
-        generated_at=args.generated_at or _generated_at(),
+        generated_at=_resolve_generated_at(args.generated_at),
         skipped_rows=len(warnings),
     )
 
@@ -619,7 +833,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="vendor", required=True)
 
     google = subparsers.add_parser("google", help="Export from a Google Workspace audit CSV export.")
-    google.add_argument("--audit-csv", required=True, help="Path to the OAuth Token Audit Activity CSV export.")
+    google.add_argument(
+        "--audit-csv",
+        required=True,
+        help=(
+            "Path to the OAuth audit CSV: the Admin console's OAuth log events download as is, "
+            "or a Reports API export with columns time, actorEmail, clientId, displayText, scopes."
+        ),
+    )
+    google.add_argument(
+        "--export-window-start",
+        default=None,
+        help="Start of the date range the export covers (ISO-8601 with offset). Give with --export-window-end.",
+    )
+    google.add_argument(
+        "--export-window-end",
+        default=None,
+        help="End of the date range the export covers (ISO-8601 with offset). Give with --export-window-start.",
+    )
     google.add_argument("--users-csv", default=None, help="Optional path to a Users CSV export.")
     google.add_argument("--out-dir", required=True, help="Directory to write DEF output into.")
     google.add_argument("--salt-file", default=None, help="Path to a fixed hex salt (for reproducible output).")
@@ -697,7 +928,7 @@ def run_entra(args: argparse.Namespace) -> None:
         export_window=None,
         grant_objects=grant_objects,
         salt_bytes=salt_bytes,
-        generated_at=args.generated_at or _generated_at(),
+        generated_at=_resolve_generated_at(args.generated_at),
         skipped_rows=len(warnings),
     )
 

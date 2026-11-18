@@ -10,6 +10,7 @@ definition; this module enforces exactly what that spec pins down.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import re
 
@@ -46,6 +47,31 @@ GRANT_REQUIRED_FIELDS = (
 # prefixed with "user_" — see spec section "userRef derivation".
 USER_REF_HASH_RE = re.compile(r"^user_[0-9a-f]{16}$")
 
+# Every DEF timestamp is ISO-8601 UTC with a `Z` suffix and optional
+# fractional seconds of any length. Discover's intake checks the same shape
+# (its DEF schema's ISO_DATETIME_RE, where JavaScript's \d is ASCII-only)
+# and that Date.parse accepts the value. Here that is: re.ASCII, a whole-string
+# match (`$` would also match before a trailing newline), and a calendar check
+# of the date and time.
+UTC_DATETIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z", re.ASCII)
+
+
+def _check_utc(value, field: str, nullable: bool) -> None:
+    if value is None and nullable:
+        return
+    match = UTC_DATETIME_RE.fullmatch(value) if isinstance(value, str) else None
+    valid = match is not None
+    if valid:
+        try:
+            datetime.datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            valid = False
+    if not valid:
+        allowed = "null or " if nullable else ""
+        raise DefValidationError(
+            f"{field} must be {allowed}an ISO-8601 UTC timestamp ending in 'Z', got {value!r}"
+        )
+
 
 class DefValidationError(ValueError):
     """Raised when a DEF header or grant line fails validation."""
@@ -77,8 +103,14 @@ def validate_header(header: dict) -> None:
     if not isinstance(header["pseudonymized"], bool):
         raise DefValidationError("header.pseudonymized must be a boolean")
 
-    if not isinstance(header["generatedAt"], str) or not header["generatedAt"]:
-        raise DefValidationError("header.generatedAt must be a non-empty string")
+    _check_utc(header["generatedAt"], "header.generatedAt", nullable=False)
+
+    window = header["exportWindow"]
+    if window is not None:
+        if not isinstance(window, dict) or set(window) != {"start", "end"}:
+            raise DefValidationError("header.exportWindow must be null or an object with exactly start and end")
+        _check_utc(window["start"], "header.exportWindow.start", nullable=False)
+        _check_utc(window["end"], "header.exportWindow.end", nullable=False)
 
     if not isinstance(header["script"], str) or not header["script"]:
         raise DefValidationError("header.script must be a non-empty string")
@@ -131,11 +163,8 @@ def validate_grant(grant: dict, pseudonymized: bool) -> None:
     ):
         raise DefValidationError("grant.scopes must be an array of strings")
 
-    if grant["firstSeen"] is not None and not isinstance(grant["firstSeen"], str):
-        raise DefValidationError("grant.firstSeen must be null or a string")
-
-    if grant["lastUsed"] is not None and not isinstance(grant["lastUsed"], str):
-        raise DefValidationError("grant.lastUsed must be null or a string")
+    _check_utc(grant["firstSeen"], "grant.firstSeen", nullable=True)
+    _check_utc(grant["lastUsed"], "grant.lastUsed", nullable=True)
 
 
 def validate_def_lines(lines: list[dict]) -> None:

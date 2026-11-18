@@ -36,11 +36,17 @@ nullable.
 | `pseudonymized` | boolean | no | `true` unless the operator explicitly opted out (`--no-pseudonymize` / `-NoPseudonymize`). |
 | `hashAlgo` | string | no | Always the literal `"hmac-sha256"`, **even when `pseudonymized` is `false`** — it documents which algorithm *would* be used, keeping the header shape constant across both modes. |
 | `script` | string | no | Identifies the producing *capability*, not necessarily the literal invoking filename: `"nc-export.py"` for the Google path (only one implementation exists), and `"nc-export-entra"` for the Entra path — used by **both** `nc-export.py entra` and `nc-export-entra.ps1`, since those two implementations are required to be byte-identical for the same input and this field must not be the thing that breaks that. |
-| `exportWindow` | object or null | yes | `{"start": <ISO-8601>, "end": <ISO-8601>}` when the source data has a known time bound (e.g. the admin console audit log's retention window), otherwise `null`. Coverage-honesty field: a script MUST NOT guess this. |
+| `exportWindow` | object or null | yes | `{"start": <ISO-8601 UTC>, "end": <ISO-8601 UTC>}` when the source data has a known time bound (e.g. the admin console audit log's retention window), otherwise `null`. Coverage-honesty field: a script MUST NOT guess this. |
 | `userCountTotal` | integer or null | yes | Total distinct users in the source directory, when known (e.g. from a Users export/API call). `null` when no independent user count was available — this is normal, not an error, and MUST NOT be silently filled in from the grants seen. |
 | `skippedRows` | integer | no | Count of source grant rows dropped (skipped, with a warning printed to stderr) while building this export — e.g. a Google audit CSV row missing a required value, or an Entra grant whose service principal or user could not be resolved or had a missing/blank identity field. **Never** `null` — always an integer, `0` when nothing was skipped. Does **not** count `"AllPrincipals"` grant lines (see below) — those are emitted, not skipped. Producers MUST also print this count to stdout as part of the closing summary (see "Side files" / script behavior), even when it is `0`, so an operator never has to infer silent data loss from a byte count. |
 
 Key order in the emitted JSON object is exactly the table order above.
+
+**Every DEF timestamp** (`generatedAt`, `exportWindow.start`/`end`,
+`firstSeen`, `lastUsed`) matches
+`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$`: UTC, a `Z` suffix,
+optional fractional seconds of any length. The Discover intake refuses any
+other form.
 
 ## Grant object
 
@@ -56,8 +62,8 @@ grant with no associated user.
 | `clientId` | string | no | The vendor's stable OAuth client identifier (Google: the OAuth client ID string from the audit log; Entra: the service principal's `appId`, never its internal `objectId`). |
 | `appDisplayName` | string | no | Human-readable app name, taken verbatim from the source (UTF-8, unescaped). |
 | `scopes` | array of strings | no | The union of every OAuth scope seen for this (user, clientId) pair. May be empty. An app-role assignment (see "Grant sources" below) contributes a scope of the form `"appRole:<role value>"` (or `"appRole:<appRoleId GUID>"` when the role's display value can't be resolved). |
-| `firstSeen` | string or null | yes | ISO-8601 timestamp of the earliest evidence of this grant, or `null` when the source has no such timestamp (e.g. Entra's `oauth2PermissionGrants` has no `createdDateTime` on older grants). Producers MUST pass this value through **verbatim** from the source (including fractional-second precision, e.g. `"2022-05-04T13:22:56.7315339Z"`) — never reformat, round, or truncate it. |
-| `lastUsed` | string or null | yes | ISO-8601 timestamp of the most recent evidence of use, or `null` when unavailable. |
+| `firstSeen` | string or null | yes | ISO-8601 UTC timestamp of the earliest evidence of this grant, or `null` when the source has no such timestamp (e.g. Entra's `oauth2PermissionGrants` has no `createdDateTime` on older grants). A source value already in UTC (`Z`) MUST be passed through **verbatim** (including fractional-second precision, e.g. `"2022-05-04T13:22:56.7315339Z"`) — never reformat, round, or truncate it. **Google producer (`nc-export.py google`):** a source value with a numeric offset (the Admin console download writes local time, e.g. `"2026-11-18T14:08:23-05:00"`) is shifted to UTC with its fractional-second digits kept exactly, and a row whose time has no offset, or is not a real date and time, is skipped (counted in `skippedRows`): its instant is unknown and is not guessed. **Entra producers** pass Graph's `createdDateTime` through as is, relying on Graph emitting UTC `Z`; they do not convert offsets yet. |
+| `lastUsed` | string or null | yes | ISO-8601 UTC timestamp of the most recent evidence of use, or `null` when unavailable. Same UTC rules as `firstSeen`. |
 
 Key order in the emitted JSON object is exactly the table order above.
 
@@ -100,6 +106,9 @@ to key on:
   source row order.
 - **`firstSeen`**: the minimum of all non-null timestamps seen for that
   pair; `null` only if every source row had a null/missing timestamp.
+  The Google producer compares instants (so `"…00Z"` is earlier than
+  `"…00.5Z"`); the Entra producers compare the strings ordinally, which
+  matches the instant order whenever fractional-second lengths agree.
 - **`lastUsed`**: the maximum of all non-null timestamps seen for that
   pair; `null` only if every source row had a null/missing timestamp.
 - **`appDisplayName`**: the display name as seen on any row for that

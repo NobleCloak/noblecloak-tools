@@ -45,16 +45,41 @@ Full format details: [`spec/discover-export-format-v1.md`](spec/discover-export-
 
 ### Google Workspace
 
-1. Export the Admin Console **Reports > OAuth Token Audit Activity** log to
-   CSV, and (optionally) a **Users** CSV for an accurate `userCountTotal`.
+1. In the Admin console, open **Reporting > Audit and investigation >
+   OAuth log events**, set the date range, and **Download > CSV**. Pass the
+   file as downloaded: the script reads the console's column names
+   (`Date`, `App ID`, `App name`, `User`, `Scope`, `OAuth event`) and its
+   `", "`-separated scopes. A Reports API export with the columns
+   `time, actorEmail, clientId, displayText, scopes` works too.
+   Optionally, also download **Directory > Users > Download users > All
+   user info columns > CSV** for an accurate `userCountTotal`. Pass it as
+   downloaded: the script counts the distinct `Email Address [Required]`
+   values (suspended accounts included; recovery and secondary addresses
+   are not users). A CSV with an `email` column works too.
 2. Run:
 
    ```sh
    python3 scripts/nc-export.py google \
-     --audit-csv oauth-token-audit.csv \
+     --audit-csv OauthLogEvents.csv \
      --users-csv users.csv \
+     --export-window-start 2026-11-11T00:00:00-05:00 \
+     --export-window-end 2026-11-18T23:59:59-05:00 \
      --out-dir ./out
    ```
+
+   `--export-window-start` / `--export-window-end` are optional and go
+   together: give the date range you chose in the console, with your
+   console's UTC offset, and it is written to the header's `exportWindow`
+   in UTC. Leave both out and `exportWindow` is `null`. The script never
+   infers the window from the event dates.
+
+   The console writes event times in local time (e.g. `-05:00`); the
+   export converts every timestamp to UTC (`Z`), keeping fractional
+   seconds, because Discover accepts only UTC.
+
+   Only `Authorize` events become grants. Other events in the console
+   download (e.g. `Revoke`) are left out, with a count on stderr; they are
+   not counted in `skippedRows`.
 3. Share `./out/discover-export.ndjson` with NobleCloak Discover. Keep
    `./out/salt.txt` and `./out/mapping.csv` local.
 

@@ -152,5 +152,40 @@ class TestValidateGrant(unittest.TestCase):
             validate_grant(make_grant(userRef=None), pseudonymized=True)
 
 
+class TestDefTimestamps(unittest.TestCase):
+    """Every DEF timestamp must be UTC with a Z suffix -- Discover's intake rule."""
+
+    def test_utc_z_with_and_without_fractional_seconds_accepted(self):
+        for value in ("2026-08-17T12:00:00Z", "2022-05-04T13:22:56.7315339Z"):
+            with self.subTest(value=value):
+                validate_grant(make_grant(firstSeen=value, lastUsed=value), pseudonymized=True)
+                validate_header(make_header(generatedAt=value, exportWindow={"start": value, "end": value}))
+
+    def test_offset_or_naive_timestamps_rejected_everywhere(self):
+        for value in (
+            "2026-11-18T14:08:23-05:00", "2026-11-18T19:08:23+00:00", "2026-11-18T19:08:23", "2026-11-18",
+            "2026-13-45T99:99:99Z",                           # right shape, not a real time
+            "\uff12\uff10\uff12\uff16-01-01T00:00:00Z",   # fullwidth digits (JS \\d is ASCII-only)
+            "2026-01-01T00:00:00Z\n",                        # trailing newline
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(DefValidationError, "generatedAt"):
+                    validate_header(make_header(generatedAt=value))
+                with self.assertRaisesRegex(DefValidationError, "exportWindow.start"):
+                    validate_header(make_header(exportWindow={"start": value, "end": "2026-08-17T12:00:00Z"}))
+                with self.assertRaisesRegex(DefValidationError, "exportWindow.end"):
+                    validate_header(make_header(exportWindow={"start": "2026-08-17T12:00:00Z", "end": value}))
+                with self.assertRaisesRegex(DefValidationError, "firstSeen"):
+                    validate_grant(make_grant(firstSeen=value), pseudonymized=True)
+                with self.assertRaisesRegex(DefValidationError, "lastUsed"):
+                    validate_grant(make_grant(lastUsed=value), pseudonymized=True)
+
+    def test_export_window_must_have_exactly_start_and_end(self):
+        for window in ({"start": "2026-08-17T12:00:00Z"}, "2026-08-17", {"start": "2026-08-17T12:00:00Z", "end": "2026-08-17T12:00:00Z", "x": 1}):
+            with self.subTest(window=window):
+                with self.assertRaisesRegex(DefValidationError, "exportWindow"):
+                    validate_header(make_header(exportWindow=window))
+
+
 if __name__ == "__main__":
     unittest.main()

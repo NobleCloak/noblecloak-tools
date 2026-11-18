@@ -1,0 +1,4 @@
+First Name [Required],Last Name [Required],Email Address [Required],Password [Required],Password Hash Function [UPLOAD ONLY],Org Unit Path [Required],New Primary Email [UPLOAD ONLY],Status [READ ONLY],Last Sign In [READ ONLY],Recovery Email,Home Secondary Email,Work Secondary Email
+Alice,Example,alice@example.com,****,,/,,Active,2026-11-17T15:00:00.000Z,alice.recovery@example.org,,
+Bob,Example,bob@example.com,****,,/,,Active,Never logged in,,,
+Carol,Example,carol@example.com,****,,/,,Suspended,2026-10-01T12:00:00.000Z,,,
