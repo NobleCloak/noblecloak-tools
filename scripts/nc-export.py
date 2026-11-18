@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import stat
 import sys
@@ -67,6 +68,23 @@ GOOGLE_AUDIT_REQUIRED_COLUMNS = ["time", "actorEmail", "clientId", "displayText"
 # grant.scopes "May be empty" -- an empty scopes cell is valid input, not a
 # malformed row, and must not be skipped the way a missing actorEmail is.
 GOOGLE_AUDIT_REQUIRED_NONEMPTY_COLUMNS = ["time", "actorEmail", "clientId", "displayText"]
+
+# The Admin console's own download (Reporting > Audit and investigation >
+# OAuth log events > Download > CSV) names the same fields differently, and
+# also carries an "OAuth event" column. Maps each canonical column above to
+# its console header.
+GOOGLE_CONSOLE_COLUMNS = {
+    "time": "Date",
+    "actorEmail": "User",
+    "clientId": "App ID",
+    "displayText": "App name",
+    "scopes": "Scope",
+}
+GOOGLE_CONSOLE_EVENT_COLUMN = "OAuth event"
+# Only an Authorize event is evidence of a grant. Every other event (e.g.
+# Revoke) is left out of the export: it is not a grant row, so it is not
+# counted in skippedRows either.
+GOOGLE_GRANT_EVENT = "Authorize"
 GOOGLE_USERS_REQUIRED_COLUMNS = ["email"]
 
 OWNER_ONLY_MODE = stat.S_IRUSR | stat.S_IWUSR  # 0600
@@ -178,16 +196,60 @@ def dump_line(obj: dict, keys: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def parse_google_audit_csv(path: str) -> tuple[list[dict], list[str]]:
+def _google_audit_layout(path: str, fieldnames: list[str]) -> tuple[dict[str, str], Optional[str]]:
+    """Pick the column layout of a Google audit CSV from its header row.
+
+    Returns (columns, event_column): `columns` maps each canonical column
+    name to the header that holds it in this file, and `event_column` names
+    the column holding the OAuth event type, or None when the layout has
+    none. Raises ExportError naming both accepted layouts when the header
+    matches neither.
+    """
+    present = set(fieldnames)
+    if all(c in present for c in GOOGLE_AUDIT_REQUIRED_COLUMNS):
+        return {c: c for c in GOOGLE_AUDIT_REQUIRED_COLUMNS}, None
+
+    console_required = list(GOOGLE_CONSOLE_COLUMNS.values()) + [GOOGLE_CONSOLE_EVENT_COLUMN]
+    if all(c in present for c in console_required):
+        return dict(GOOGLE_CONSOLE_COLUMNS), GOOGLE_CONSOLE_EVENT_COLUMN
+
+    missing_api = [c for c in GOOGLE_AUDIT_REQUIRED_COLUMNS if c not in present]
+    missing_console = [c for c in console_required if c not in present]
+    raise ExportError(
+        f"audit CSV '{path}' is missing required column(s): {', '.join(missing_api)} "
+        f"(Reports API columns: {', '.join(GOOGLE_AUDIT_REQUIRED_COLUMNS)}); "
+        f"as an Admin console download it is missing: {', '.join(missing_console)} "
+        f"(console columns: {', '.join(console_required)})"
+    )
+
+
+def _split_scopes(value: str) -> list[str]:
+    """Split a scopes cell on spaces and/or commas.
+
+    The Reports API joins scopes with a space and the Admin console download
+    joins them with ", ". An OAuth scope token never contains either
+    character (RFC 6749 section 3.3), so splitting on both is lossless.
+    """
+    return [s for s in re.split(r"[,\s]+", value) if s]
+
+
+def parse_google_audit_csv(path: str) -> tuple[list[dict], list[str], int]:
     """Parse a Google OAuth Token Audit CSV.
 
-    Returns (raw_grants, warnings). Raises ExportError for a missing
-    required column or a completely empty (headerless) file. A row with a
-    missing, explicit-empty, or whitespace-only required value is skipped
-    with a warning rather than raising.
+    Accepts either the Reports API column names (`time, actorEmail,
+    clientId, displayText, scopes`) or the Admin console's OAuth log events
+    download, as downloaded (see GOOGLE_CONSOLE_COLUMNS). A UTF-8 byte order
+    mark on the header is ignored.
+
+    Returns (raw_grants, warnings, ignored_events). Raises ExportError for a
+    header that matches neither layout or a completely empty (headerless)
+    file. A row with a missing, explicit-empty, or whitespace-only required
+    value is skipped with a warning rather than raising. In the console
+    layout, a row whose OAuth event is not Authorize is not a grant: it is
+    left out and counted in `ignored_events`, not in `warnings`.
     """
     try:
-        fh = open(path, "r", encoding="utf-8", newline="")
+        fh = open(path, "r", encoding="utf-8-sig", newline="")
     except OSError as exc:
         raise ExportError(f"cannot open audit CSV '{path}': {exc}") from exc
 
@@ -196,18 +258,19 @@ def parse_google_audit_csv(path: str) -> tuple[list[dict], list[str]]:
         if reader.fieldnames is None:
             raise ExportError(f"audit CSV '{path}' has no header row")
 
-        missing = [c for c in GOOGLE_AUDIT_REQUIRED_COLUMNS if c not in reader.fieldnames]
-        if missing:
-            raise ExportError(
-                f"audit CSV '{path}' is missing required column(s): {', '.join(missing)}"
-            )
+        columns, event_column = _google_audit_layout(path, list(reader.fieldnames))
 
         raw_grants: list[dict] = []
         warnings: list[str] = []
+        ignored_events = 0
         for row_number, row in enumerate(reader, start=2):  # header is line 1
-            values = {col: row.get(col) for col in GOOGLE_AUDIT_REQUIRED_COLUMNS}
+            if event_column is not None and (row.get(event_column) or "").strip() != GOOGLE_GRANT_EVENT:
+                ignored_events += 1
+                continue
+
+            values = {col: row.get(header) for col, header in columns.items()}
             missing_values = [
-                col
+                columns[col]
                 for col in GOOGLE_AUDIT_REQUIRED_NONEMPTY_COLUMNS
                 if (values.get(col) or "").strip() == ""
             ]
@@ -218,8 +281,7 @@ def parse_google_audit_csv(path: str) -> tuple[list[dict], list[str]]:
                 )
                 continue
 
-            scopes_value = values.get("scopes") or ""
-            scopes = [s for s in scopes_value.split(" ") if s]
+            scopes = _split_scopes(values.get("scopes") or "")
             raw_grants.append(
                 {
                     "email": values["actorEmail"],
@@ -232,7 +294,7 @@ def parse_google_audit_csv(path: str) -> tuple[list[dict], list[str]]:
                 }
             )
 
-        return raw_grants, warnings
+        return raw_grants, warnings, ignored_events
 
 
 def _read_json(path: str) -> dict:
@@ -577,10 +639,48 @@ def _warn_if_empty_result(user_count_total: Optional[int], grant_objects: list[d
 # ---------------------------------------------------------------------------
 
 
+def _parse_window_bound(flag: str, value: str):
+    import datetime
+
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ExportError(f"{flag} '{value}' is not an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ExportError(f"{flag} '{value}' needs a UTC offset (e.g. 'Z' or '-05:00')")
+    return parsed
+
+
+def resolve_export_window(start: Optional[str], end: Optional[str]) -> Optional[dict]:
+    """Build the header's exportWindow from the operator's --export-window-* flags.
+
+    The spec forbids guessing the window, so it is only ever what the
+    operator states: both flags (the date range they chose in the console),
+    written verbatim, or neither (null). Raises ExportError for one flag
+    without the other, a timestamp that is not ISO-8601 with an offset, or a
+    start after the end.
+    """
+    if start is None and end is None:
+        return None
+    if start is None or end is None:
+        raise ExportError("--export-window-start and --export-window-end must be given both or neither")
+    if _parse_window_bound("--export-window-start", start) > _parse_window_bound("--export-window-end", end):
+        raise ExportError(f"--export-window-start '{start}' is after --export-window-end '{end}'")
+    return {"start": start, "end": end}
+
+
 def run_google(args: argparse.Namespace) -> None:
-    raw_grants, warnings = parse_google_audit_csv(args.audit_csv)
+    export_window = resolve_export_window(args.export_window_start, args.export_window_end)
+
+    raw_grants, warnings, ignored_events = parse_google_audit_csv(args.audit_csv)
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
+    if ignored_events:
+        print(
+            f"note: left out {ignored_events} non-Authorize event row(s) (e.g. Revoke); "
+            "they are not grants and are not counted as skipped",
+            file=sys.stderr,
+        )
 
     user_count_total = None
     if args.users_csv is not None:
@@ -600,7 +700,7 @@ def run_google(args: argparse.Namespace) -> None:
         script_name="nc-export.py",
         pseudonymized=pseudonymized,
         user_count_total=user_count_total,
-        export_window=None,
+        export_window=export_window,
         grant_objects=grant_objects,
         salt_bytes=salt_bytes,
         generated_at=args.generated_at or _generated_at(),
@@ -619,7 +719,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="vendor", required=True)
 
     google = subparsers.add_parser("google", help="Export from a Google Workspace audit CSV export.")
-    google.add_argument("--audit-csv", required=True, help="Path to the OAuth Token Audit Activity CSV export.")
+    google.add_argument(
+        "--audit-csv",
+        required=True,
+        help=(
+            "Path to the OAuth audit CSV: the Admin console's OAuth log events download as is, "
+            "or a Reports API export with columns time, actorEmail, clientId, displayText, scopes."
+        ),
+    )
+    google.add_argument(
+        "--export-window-start",
+        default=None,
+        help="Start of the date range the export covers (ISO-8601 with offset). Give with --export-window-end.",
+    )
+    google.add_argument(
+        "--export-window-end",
+        default=None,
+        help="End of the date range the export covers (ISO-8601 with offset). Give with --export-window-start.",
+    )
     google.add_argument("--users-csv", default=None, help="Optional path to a Users CSV export.")
     google.add_argument("--out-dir", required=True, help="Directory to write DEF output into.")
     google.add_argument("--salt-file", default=None, help="Path to a fixed hex salt (for reproducible output).")

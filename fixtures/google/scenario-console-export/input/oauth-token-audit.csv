@@ -1,0 +1,4 @@
+Date,App ID,App name,OAuth event,Description,User,Scope,API name,Method,Number of response bytes,IP address,Product,Client type,Network info,By an agent,Agent info,User approved
+2026-01-05T10:00:00Z,111111111111-aaa.apps.googleusercontent.com,Slack,Authorize,,alice@example.com,"https://www.googleapis.com/auth/drive.readonly, https://www.googleapis.com/auth/userinfo.email",,,,,Drive,Web,,false,,false
+2026-02-10T09:30:00Z,222222222222-bbb.apps.googleusercontent.com,Zoom,Authorize,,bob@example.com,https://www.googleapis.com/auth/calendar.readonly,,,,,Calendar,Web,,false,,false
+2026-02-11T08:00:00Z,333333333333-ccc.apps.googleusercontent.com,Miro,Revoke,,carol@example.com,https://www.googleapis.com/auth/drive.file,,,,,Drive,Web,,false,,false
