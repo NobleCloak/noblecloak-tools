@@ -162,7 +162,12 @@ class TestDefTimestamps(unittest.TestCase):
                 validate_header(make_header(generatedAt=value, exportWindow={"start": value, "end": value}))
 
     def test_offset_or_naive_timestamps_rejected_everywhere(self):
-        for value in ("2026-11-18T14:08:23-05:00", "2026-11-18T19:08:23+00:00", "2026-11-18T19:08:23", "2026-11-18"):
+        for value in (
+            "2026-11-18T14:08:23-05:00", "2026-11-18T19:08:23+00:00", "2026-11-18T19:08:23", "2026-11-18",
+            "2026-13-45T99:99:99Z",                           # right shape, not a real time
+            "\uff12\uff10\uff12\uff16-01-01T00:00:00Z",   # fullwidth digits (JS \\d is ASCII-only)
+            "2026-01-01T00:00:00Z\n",                        # trailing newline
+        ):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(DefValidationError, "generatedAt"):
                     validate_header(make_header(generatedAt=value))

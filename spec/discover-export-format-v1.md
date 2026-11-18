@@ -62,7 +62,7 @@ grant with no associated user.
 | `clientId` | string | no | The vendor's stable OAuth client identifier (Google: the OAuth client ID string from the audit log; Entra: the service principal's `appId`, never its internal `objectId`). |
 | `appDisplayName` | string | no | Human-readable app name, taken verbatim from the source (UTF-8, unescaped). |
 | `scopes` | array of strings | no | The union of every OAuth scope seen for this (user, clientId) pair. May be empty. An app-role assignment (see "Grant sources" below) contributes a scope of the form `"appRole:<role value>"` (or `"appRole:<appRoleId GUID>"` when the role's display value can't be resolved). |
-| `firstSeen` | string or null | yes | ISO-8601 UTC timestamp of the earliest evidence of this grant, or `null` when the source has no such timestamp (e.g. Entra's `oauth2PermissionGrants` has no `createdDateTime` on older grants). A source value already in UTC (`Z`) MUST be passed through **verbatim** (including fractional-second precision, e.g. `"2022-05-04T13:22:56.7315339Z"`) — never reformat, round, or truncate it. A source value with a numeric offset (the Google Admin console download writes local time, e.g. `"2026-11-18T14:08:23-05:00"`) MUST be shifted to UTC with its fractional-second digits kept exactly. A source row whose time has no offset is skipped (and counted in `skippedRows`): its instant is unknown and is not guessed. |
+| `firstSeen` | string or null | yes | ISO-8601 UTC timestamp of the earliest evidence of this grant, or `null` when the source has no such timestamp (e.g. Entra's `oauth2PermissionGrants` has no `createdDateTime` on older grants). A source value already in UTC (`Z`) MUST be passed through **verbatim** (including fractional-second precision, e.g. `"2022-05-04T13:22:56.7315339Z"`) — never reformat, round, or truncate it. **Google producer (`nc-export.py google`):** a source value with a numeric offset (the Admin console download writes local time, e.g. `"2026-11-18T14:08:23-05:00"`) is shifted to UTC with its fractional-second digits kept exactly, and a row whose time has no offset, or is not a real date and time, is skipped (counted in `skippedRows`): its instant is unknown and is not guessed. **Entra producers** pass Graph's `createdDateTime` through as is, relying on Graph emitting UTC `Z`; they do not convert offsets yet. |
 | `lastUsed` | string or null | yes | ISO-8601 UTC timestamp of the most recent evidence of use, or `null` when unavailable. Same UTC rules as `firstSeen`. |
 
 Key order in the emitted JSON object is exactly the table order above.
@@ -106,6 +106,9 @@ to key on:
   source row order.
 - **`firstSeen`**: the minimum of all non-null timestamps seen for that
   pair; `null` only if every source row had a null/missing timestamp.
+  The Google producer compares instants (so `"…00Z"` is earlier than
+  `"…00.5Z"`); the Entra producers compare the strings ordinally, which
+  matches the instant order whenever fractional-second lengths agree.
 - **`lastUsed`**: the maximum of all non-null timestamps seen for that
   pair; `null` only if every source row had a null/missing timestamp.
 - **`appDisplayName`**: the display name as seen on any row for that

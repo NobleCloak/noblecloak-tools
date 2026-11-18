@@ -380,7 +380,7 @@ class TestGoogleTimestampsInUtc(unittest.TestCase):
         self.assertEqual(grant["lastUsed"], "2026-11-18T15:38:26.1230Z")
         validate_def_file(self.out_dir / "discover-export.ndjson")
 
-    def test_min_and_max_compare_instants_not_text(self):
+    def test_min_and_max_across_mixed_offsets_use_the_instant(self):
         # 01:30-05:00 is 06:30Z, later than 05:00+00:00 (05:00Z) though it sorts
         # first as text. Across a DST change one file carries both -04:00 and -05:00.
         result = self._export(
@@ -408,6 +408,64 @@ class TestGoogleTimestampsInUtc(unittest.TestCase):
         self.assertEqual([g["appDisplayName"] for g in grants], ["Zoom"])
         header = json.loads((self.out_dir / "discover-export.ndjson").read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(header["skippedRows"], 1)
+
+    def test_min_and_max_compare_fractional_seconds_as_time_not_text(self):
+        # As text, "00.5Z" sorts before "00Z" ('.' < 'Z'), which would make
+        # firstSeen later than lastUsed. Offset conversion keeps fractional
+        # digits, so one console file can mix both lengths.
+        result = self._export(
+            API_HEADER
+            + "2026-01-01T00:00:00Z,alice@example.com,111-aaa.apps.googleusercontent.com,Slack,openid\n"
+            + "2026-01-01T00:00:00.5Z,alice@example.com,111-aaa.apps.googleusercontent.com,Slack,openid\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        grant = self._grants()[0]
+        self.assertEqual(grant["firstSeen"], "2026-01-01T00:00:00Z")
+        self.assertEqual(grant["lastUsed"], "2026-01-01T00:00:00.5Z")
+
+    def test_invalid_or_non_ascii_times_are_skipped_not_emitted(self):
+        rows = [
+            "2026-13-45T99:99:99Z",                 # matches the shape, not a real time
+            "\uff12\uff10\uff12\uff16-01-01T00:00:00Z",  # fullwidth digits
+            "0001-01-01T00:00:00+01:00",            # shifts before year 1
+        ]
+        body = "".join(
+            f"{t},user{i}@example.com,{i}-x.apps.googleusercontent.com,App{i},openid\n" for i, t in enumerate(rows)
+        )
+        result = self._export(API_HEADER + body + "2026-01-01T00:00:00Z,ok@example.com,ok.apps.googleusercontent.com,Ok,openid\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([g["appDisplayName"] for g in self._grants()], ["Ok"])
+        header = json.loads((self.out_dir / "discover-export.ndjson").read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(header["skippedRows"], 3)
+
+    def test_early_year_is_zero_padded(self):
+        result = self._export(
+            API_HEADER + "0999-06-01T12:00:00+02:00,alice@example.com,111-aaa.apps.googleusercontent.com,Slack,openid\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._grants()[0]["firstSeen"], "0999-06-01T10:00:00Z")
+
+    def test_header_with_both_layouts_still_filters_on_oauth_event(self):
+        header = "time,actorEmail,clientId,displayText,scopes,OAuth event\n"
+        result = self._export(
+            header
+            + "2026-01-01T00:00:00Z,alice@example.com,111-aaa.apps.googleusercontent.com,Slack,openid,Authorize\n"
+            + "2026-01-02T00:00:00Z,bob@example.com,222-bbb.apps.googleusercontent.com,Miro,openid,Revoke\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([g["appDisplayName"] for g in self._grants()], ["Slack"])
+        self.assertIn("1 non-Authorize event", result.stderr)
+
+    def test_generated_at_override_must_be_utc(self):
+        audit = self.tmp / "a.csv"
+        audit.write_text(API_HEADER, encoding="utf-8")
+        result = run(
+            ["google", "--audit-csv", str(audit), "--out-dir", str(self.out_dir), "--generated-at", "2026-11-18T10:00:00-05:00"],
+            cwd=self.tmp,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        header = json.loads((self.out_dir / "discover-export.ndjson").read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(header["generatedAt"], "2026-11-18T15:00:00Z")
 
 
 if __name__ == "__main__":

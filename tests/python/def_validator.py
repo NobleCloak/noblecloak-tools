@@ -10,6 +10,7 @@ definition; this module enforces exactly what that spec pins down.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import re
 
@@ -47,16 +48,25 @@ GRANT_REQUIRED_FIELDS = (
 USER_REF_HASH_RE = re.compile(r"^user_[0-9a-f]{16}$")
 
 # Every DEF timestamp is ISO-8601 UTC with a `Z` suffix and optional
-# fractional seconds of any length. This is the exact rule the Discover
-# intake enforces (its DEF schema's ISO_DATETIME_RE), so an export that
-# passes here is not refused there for a timestamp.
-UTC_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
+# fractional seconds of any length. Discover's intake checks the same shape
+# (its DEF schema's ISO_DATETIME_RE, where JavaScript's \d is ASCII-only)
+# and that Date.parse accepts the value. Here that is: re.ASCII, a whole-string
+# match (`$` would also match before a trailing newline), and a calendar check
+# of the date and time.
+UTC_DATETIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z", re.ASCII)
 
 
 def _check_utc(value, field: str, nullable: bool) -> None:
     if value is None and nullable:
         return
-    if not isinstance(value, str) or not UTC_DATETIME_RE.match(value):
+    match = UTC_DATETIME_RE.fullmatch(value) if isinstance(value, str) else None
+    valid = match is not None
+    if valid:
+        try:
+            datetime.datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            valid = False
+    if not valid:
         allowed = "null or " if nullable else ""
         raise DefValidationError(
             f"{field} must be {allowed}an ISO-8601 UTC timestamp ending in 'Z', got {value!r}"

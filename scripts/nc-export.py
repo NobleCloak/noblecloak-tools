@@ -119,7 +119,7 @@ def derive_user_ref(salt_bytes: bytes, email: str, pseudonymized: bool) -> str:
     return "user_" + digest[:16]
 
 
-def dedupe_grants(raw_grants: list[dict]) -> list[dict]:
+def dedupe_grants(raw_grants: list[dict], time_key=None) -> list[dict]:
     """Collapse raw (event-level) grant rows into one entry per (email, clientId) --
     or, for an "AllPrincipals" row (no associated user), per clientId alone.
 
@@ -131,6 +131,11 @@ def dedupe_grants(raw_grants: list[dict]) -> list[dict]:
     sorted, `firstSeen`/`lastUsed` reduced to min/max of the non-null
     values seen. A "Principal" row and an "AllPrincipals" row for the same
     clientId are never merged with each other -- they key differently.
+
+    `time_key` orders the firstSeen/lastUsed values. None compares the
+    strings ordinally, which is what nc-export-entra.ps1 does
+    ([string]::CompareOrdinal), so the Entra path keeps it for byte-identical
+    parity. The Google path passes utc_instant_key, which compares instants.
     """
     grouped: dict[tuple[str, str], dict] = {}
     for raw in raw_grants:
@@ -154,12 +159,14 @@ def dedupe_grants(raw_grants: list[dict]) -> list[dict]:
 
         entry["scopes"].update(raw["scopes"])
 
+        key = time_key or (lambda v: v)
+
         first_seen = raw.get("firstSeen")
-        if first_seen is not None and (entry["firstSeen"] is None or first_seen < entry["firstSeen"]):
+        if first_seen is not None and (entry["firstSeen"] is None or key(first_seen) < key(entry["firstSeen"])):
             entry["firstSeen"] = first_seen
 
         last_used = raw.get("lastUsed")
-        if last_used is not None and (entry["lastUsed"] is None or last_used > entry["lastUsed"]):
+        if last_used is not None and (entry["lastUsed"] is None or key(last_used) > key(entry["lastUsed"])):
             entry["lastUsed"] = last_used
 
     return list(grouped.values())
@@ -205,13 +212,16 @@ def _google_audit_layout(path: str, fieldnames: list[str]) -> tuple[dict[str, st
 
     Returns (columns, event_column): `columns` maps each canonical column
     name to the header that holds it in this file, and `event_column` names
-    the column holding the OAuth event type, or None when the layout has
-    none. Raises ExportError naming both accepted layouts when the header
+    the column holding the OAuth event type whenever the header has one
+    (in either layout), or None. Raises ExportError naming both accepted layouts when the header
     matches neither.
     """
     present = set(fieldnames)
+    # Filter on the event column whenever it is there, whichever layout
+    # matched: a header carrying both layouts must not turn a Revoke into a grant.
+    event_column = GOOGLE_CONSOLE_EVENT_COLUMN if GOOGLE_CONSOLE_EVENT_COLUMN in present else None
     if all(c in present for c in GOOGLE_AUDIT_REQUIRED_COLUMNS):
-        return {c: c for c in GOOGLE_AUDIT_REQUIRED_COLUMNS}, None
+        return {c: c for c in GOOGLE_AUDIT_REQUIRED_COLUMNS}, event_column
 
     console_required = list(GOOGLE_CONSOLE_COLUMNS.values()) + [GOOGLE_CONSOLE_EVENT_COLUMN]
     if all(c in present for c in console_required):
@@ -227,8 +237,35 @@ def _google_audit_layout(path: str, fieldnames: list[str]) -> tuple[dict[str, st
     )
 
 
-_UTC_Z_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
-_OFFSET_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2})$")
+# re.ASCII: Python's \d also matches non-ASCII digits (e.g. fullwidth), which
+# Discover's JavaScript check does not. Matched with fullmatch, never `$`
+# (which also matches before a trailing newline).
+_UTC_Z_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z", re.ASCII)
+_OFFSET_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2})", re.ASCII)
+
+
+def _parse_whole_seconds(whole: str):
+    """Calendar-check YYYY-MM-DDTHH:MM:SS; returns a naive datetime or None."""
+    import datetime
+
+    try:
+        return datetime.datetime.strptime(whole, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+
+
+def utc_instant_key(value: str):
+    """Ordering key for a UTC `Z` timestamp: (whole seconds, fraction).
+
+    Comparing the strings themselves is wrong when fractional lengths differ
+    ("...00.5Z" sorts before "...00Z" because '.' < 'Z'). Only called on
+    values to_utc_z produced, so the match cannot fail.
+    """
+    from decimal import Decimal
+
+    match = _UTC_Z_RE.fullmatch(value)
+    whole, fraction = match.groups()
+    return (_parse_whole_seconds(whole), Decimal("0" + (fraction or "")))
 
 
 def to_utc_z(value: str) -> Optional[str]:
@@ -245,18 +282,22 @@ def to_utc_z(value: str) -> Optional[str]:
     import datetime
 
     value = value.strip()
-    if _UTC_Z_RE.match(value):
-        return value
-    match = _OFFSET_TS_RE.match(value)
+    z_match = _UTC_Z_RE.fullmatch(value)
+    if z_match is not None:
+        return value if _parse_whole_seconds(z_match.group(1)) is not None else None
+    match = _OFFSET_TS_RE.fullmatch(value)
     if match is None:
         return None
     whole, fraction, offset = match.groups()
+    if _parse_whole_seconds(whole) is None:
+        return None
     try:
         local = datetime.datetime.fromisoformat(whole + offset)
-    except ValueError:
+        utc = local.astimezone(datetime.timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    utc = local.astimezone(datetime.timezone.utc)
-    return utc.strftime("%Y-%m-%dT%H:%M:%S") + (fraction or "") + "Z"
+    # isoformat zero-pads the year (strftime("%Y") does not on glibc before 1000).
+    return utc.replace(tzinfo=None).isoformat(timespec="seconds") + (fraction or "") + "Z"
 
 
 def _split_scopes(value: str) -> list[str]:
@@ -669,6 +710,16 @@ def write_outputs(
         os.chmod(mapping_path, OWNER_ONLY_MODE)
 
 
+def _resolve_generated_at(override: Optional[str]) -> str:
+    """The header's generatedAt: now, or the test-only --generated-at override in UTC."""
+    if override is None:
+        return _generated_at()
+    resolved = to_utc_z(override)
+    if resolved is None:
+        raise ExportError(f"--generated-at '{override}' is not an ISO-8601 timestamp with a UTC offset")
+    return resolved
+
+
 def _generated_at() -> str:
     import datetime
 
@@ -752,7 +803,7 @@ def run_google(args: argparse.Namespace) -> None:
     pseudonymized = not args.no_pseudonymize
     salt_bytes = load_or_generate_salt(args.salt_file) if pseudonymized else b""
 
-    grouped = dedupe_grants(raw_grants)
+    grouped = dedupe_grants(raw_grants, time_key=utc_instant_key)
     grant_objects = build_grant_objects(grouped, salt_bytes, pseudonymized)
 
     _warn_if_empty_result(user_count_total, grant_objects)
@@ -766,7 +817,7 @@ def run_google(args: argparse.Namespace) -> None:
         export_window=export_window,
         grant_objects=grant_objects,
         salt_bytes=salt_bytes,
-        generated_at=args.generated_at or _generated_at(),
+        generated_at=_resolve_generated_at(args.generated_at),
         skipped_rows=len(warnings),
     )
 
@@ -877,7 +928,7 @@ def run_entra(args: argparse.Namespace) -> None:
         export_window=None,
         grant_objects=grant_objects,
         salt_bytes=salt_bytes,
-        generated_at=args.generated_at or _generated_at(),
+        generated_at=_resolve_generated_at(args.generated_at),
         skipped_rows=len(warnings),
     )
 
