@@ -16,6 +16,10 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 NC_EXPORT = REPO_ROOT / "scripts" / "nc-export.py"
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from def_validator import validate_def_file
+
 SALT = "a0891513aba11b839e9a5072e4e8fc3de92477b14428a45f67ad7aba856063f5"
 
 # Header row exactly as the Admin console wrote it on 2026-11-18.
@@ -289,15 +293,25 @@ class TestGoogleExportWindow(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(self._header()["exportWindow"])
 
-    def test_window_flags_are_written_verbatim(self):
+    def test_window_flags_are_written_in_utc(self):
         result = self._export(
-            "--export-window-start", "2026-01-01T00:00:00-05:00",
-            "--export-window-end", "2026-01-31T23:59:59-05:00",
+            "--export-window-start", "2026-11-11T00:00:00-05:00",
+            "--export-window-end", "2026-11-18T23:59:59.5-05:00",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self._header()["exportWindow"],
-            {"start": "2026-01-01T00:00:00-05:00", "end": "2026-01-31T23:59:59-05:00"},
+            {"start": "2026-11-11T05:00:00Z", "end": "2026-11-19T04:59:59.5Z"},
+        )
+        validate_def_file(self.out_dir / "discover-export.ndjson")
+
+    def test_window_flags_already_in_utc_are_unchanged(self):
+        result = self._export(
+            "--export-window-start", "2026-01-01T00:00:00Z", "--export-window-end", "2026-01-31T23:59:59Z"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._header()["exportWindow"], {"start": "2026-01-01T00:00:00Z", "end": "2026-01-31T23:59:59Z"}
         )
 
     def test_one_window_flag_without_the_other_errors(self):
@@ -332,6 +346,68 @@ class TestGoogleExportWindow(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("needs a UTC offset", result.stderr)
         self.assertFalse(self.out_dir.exists())
+
+
+class TestGoogleTimestampsInUtc(unittest.TestCase):
+    """Discover accepts only UTC `Z` timestamps; the console writes local offsets."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = pathlib.Path(self._tmp.name)
+        self.out_dir = self.tmp / "out"
+
+    def _export(self, content: str):
+        audit = self.tmp / "audit.csv"
+        audit.write_text(content, encoding="utf-8")
+        return run(["google", "--audit-csv", str(audit), "--out-dir", str(self.out_dir)], cwd=self.tmp)
+
+    def _grants(self):
+        text = (self.out_dir / "discover-export.ndjson").read_text(encoding="utf-8")
+        return [json.loads(line) for line in text.splitlines()[1:]]
+
+    def test_offset_times_become_utc_and_keep_fractional_digits(self):
+        result = self._export(
+            CONSOLE_HEADER
+            + console_row("2026-11-17T12:44:17-05:00", "111-aaa.apps.googleusercontent.com", "Slack", "Authorize",
+                          "alice@example.com", "openid")
+            + console_row("2026-11-18T10:38:26.1230-05:00", "111-aaa.apps.googleusercontent.com", "Slack",
+                          "Authorize", "alice@example.com", "openid")
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        grant = self._grants()[0]
+        self.assertEqual(grant["firstSeen"], "2026-11-17T17:44:17Z")
+        self.assertEqual(grant["lastUsed"], "2026-11-18T15:38:26.1230Z")
+        validate_def_file(self.out_dir / "discover-export.ndjson")
+
+    def test_min_and_max_compare_instants_not_text(self):
+        # 01:30-05:00 is 06:30Z, later than 05:00+00:00 (05:00Z) though it sorts
+        # first as text. Across a DST change one file carries both -04:00 and -05:00.
+        result = self._export(
+            CONSOLE_HEADER
+            + console_row("2026-11-01T01:30:00-05:00", "111-aaa.apps.googleusercontent.com", "Slack", "Authorize",
+                          "alice@example.com", "openid")
+            + console_row("2026-11-01T05:00:00+00:00", "111-aaa.apps.googleusercontent.com", "Slack", "Authorize",
+                          "alice@example.com", "openid")
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        grant = self._grants()[0]
+        self.assertEqual(grant["firstSeen"], "2026-11-01T05:00:00Z")
+        self.assertEqual(grant["lastUsed"], "2026-11-01T06:30:00Z")
+
+    def test_time_without_an_offset_is_skipped_with_warning(self):
+        result = self._export(
+            API_HEADER
+            + "2026-11-17T12:44:17,alice@example.com,111-aaa.apps.googleusercontent.com,Slack,openid\n"
+            + "2026-11-17T12:44:17Z,bob@example.com,222-bbb.apps.googleusercontent.com,Zoom,openid\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("UTC offset", result.stderr)
+        self.assertNotIn("alice@example.com", result.stderr)
+        grants = self._grants()
+        self.assertEqual([g["appDisplayName"] for g in grants], ["Zoom"])
+        header = json.loads((self.out_dir / "discover-export.ndjson").read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(header["skippedRows"], 1)
 
 
 if __name__ == "__main__":

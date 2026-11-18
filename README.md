@@ -68,10 +68,14 @@ Full format details: [`spec/discover-export-format-v1.md`](spec/discover-export-
    ```
 
    `--export-window-start` / `--export-window-end` are optional and go
-   together: give the date range you chose in the console, and it is
-   written to the header's `exportWindow`. Leave both out and
-   `exportWindow` is `null`. The script never infers the window from the
-   event dates.
+   together: give the date range you chose in the console, with your
+   console's UTC offset, and it is written to the header's `exportWindow`
+   in UTC. Leave both out and `exportWindow` is `null`. The script never
+   infers the window from the event dates.
+
+   The console writes event times in local time (e.g. `-05:00`); the
+   export converts every timestamp to UTC (`Z`), keeping fractional
+   seconds, because Discover accepts only UTC.
 
    Only `Authorize` events become grants. Other events in the console
    download (e.g. `Revoke`) are left out, with a count on stderr; they are

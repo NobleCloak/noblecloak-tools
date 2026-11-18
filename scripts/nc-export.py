@@ -227,6 +227,38 @@ def _google_audit_layout(path: str, fieldnames: list[str]) -> tuple[dict[str, st
     )
 
 
+_UTC_Z_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
+_OFFSET_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2})$")
+
+
+def to_utc_z(value: str) -> Optional[str]:
+    """Return `value` as an ISO-8601 UTC timestamp ending in `Z`, or None.
+
+    DEF timestamps are UTC with a `Z` suffix (the Discover intake refuses
+    anything else). A value already in that form is returned unchanged, byte
+    for byte. A value with a numeric offset (the Admin console writes local
+    time, e.g. `2026-11-18T14:08:23-05:00`) is shifted to UTC, and its
+    fractional-second digits are kept exactly as written. Anything else (no
+    offset, not ISO-8601) returns None: the instant is unknown, so it is not
+    guessed.
+    """
+    import datetime
+
+    value = value.strip()
+    if _UTC_Z_RE.match(value):
+        return value
+    match = _OFFSET_TS_RE.match(value)
+    if match is None:
+        return None
+    whole, fraction, offset = match.groups()
+    try:
+        local = datetime.datetime.fromisoformat(whole + offset)
+    except ValueError:
+        return None
+    utc = local.astimezone(datetime.timezone.utc)
+    return utc.strftime("%Y-%m-%dT%H:%M:%S") + (fraction or "") + "Z"
+
+
 def _split_scopes(value: str) -> list[str]:
     """Split a scopes cell on spaces and/or commas.
 
@@ -285,6 +317,14 @@ def parse_google_audit_csv(path: str) -> tuple[list[dict], list[str], int]:
                 )
                 continue
 
+            time_utc = to_utc_z(values["time"])
+            if time_utc is None:
+                warnings.append(
+                    f"skipping malformed row {row_number} in '{path}': "
+                    f"{columns['time']} is not an ISO-8601 timestamp with a UTC offset"
+                )
+                continue
+
             scopes = _split_scopes(values.get("scopes") or "")
             raw_grants.append(
                 {
@@ -293,8 +333,8 @@ def parse_google_audit_csv(path: str) -> tuple[list[dict], list[str], int]:
                     "appDisplayName": values["displayText"],
                     "consentType": "Principal",
                     "scopes": scopes,
-                    "firstSeen": values["time"],
-                    "lastUsed": values["time"],
+                    "firstSeen": time_utc,
+                    "lastUsed": time_utc,
                 }
             )
 
@@ -676,9 +716,9 @@ def resolve_export_window(start: Optional[str], end: Optional[str]) -> Optional[
 
     The spec forbids guessing the window, so it is only ever what the
     operator states: both flags (the date range they chose in the console),
-    written verbatim, or neither (null). Raises ExportError for one flag
-    without the other, a timestamp that is not ISO-8601 with an offset, or a
-    start after the end.
+    written in UTC (see to_utc_z), or neither (null). Raises ExportError for
+    one flag without the other, a timestamp that is not ISO-8601 with an
+    offset, or a start after the end.
     """
     if start is None and end is None:
         return None
@@ -686,7 +726,10 @@ def resolve_export_window(start: Optional[str], end: Optional[str]) -> Optional[
         raise ExportError("--export-window-start and --export-window-end must be given both or neither")
     if _parse_window_bound("--export-window-start", start) > _parse_window_bound("--export-window-end", end):
         raise ExportError(f"--export-window-start '{start}' is after --export-window-end '{end}'")
-    return {"start": start, "end": end}
+    start_utc, end_utc = to_utc_z(start), to_utc_z(end)
+    if start_utc is None or end_utc is None:
+        raise ExportError("--export-window-start / --export-window-end must be YYYY-MM-DDTHH:MM:SS with an offset")
+    return {"start": start_utc, "end": end_utc}
 
 
 def run_google(args: argparse.Namespace) -> None:
