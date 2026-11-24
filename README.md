@@ -43,6 +43,9 @@ Full format details: [`spec/discover-export-format-v1.md`](spec/discover-export-
 
 ## Quick start
 
+`nc-export.py` needs Python 3.9 or newer and nothing else (standard library
+only). macOS's built-in `python3` is 3.9, which is enough.
+
 ### Google Workspace
 
 1. In the Admin console, open **Reporting > Audit and investigation >

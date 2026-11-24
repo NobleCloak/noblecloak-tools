@@ -11,6 +11,9 @@ script must produce, and fixtures/ for golden input/output pairs.
 
 This script performs no network I/O. It only reads the local files named
 on the command line and writes to --out-dir.
+
+Requires Python 3.9 or newer (the standard library only). macOS's built-in
+python3 is 3.9.
 """
 from __future__ import annotations
 
@@ -244,6 +247,25 @@ _UTC_Z_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z", re.ASC
 _OFFSET_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2})", re.ASCII)
 
 
+_FRACTION_RE = re.compile(r"(T\d{2}:\d{2}:\d{2})\.(\d+)", re.ASCII)
+
+
+def parse_iso8601(value: str):
+    """Parse an ISO-8601 timestamp the same way on every supported Python.
+
+    `datetime.fromisoformat` before 3.11 takes only 3- or 6-digit fractional
+    seconds and no `Z`. So `Z` becomes `+00:00` and the fraction is padded or
+    truncated (never rounded) to 6 digits before parsing. Raises ValueError
+    for anything `fromisoformat` rejects.
+    """
+    import datetime
+
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    value = _FRACTION_RE.sub(lambda m: m.group(1) + "." + m.group(2)[:6].ljust(6, "0"), value, count=1)
+    return datetime.datetime.fromisoformat(value)
+
+
 def _parse_whole_seconds(whole: str):
     """Calendar-check YYYY-MM-DDTHH:MM:SS; returns a naive datetime or None."""
     import datetime
@@ -292,7 +314,7 @@ def to_utc_z(value: str) -> Optional[str]:
     if _parse_whole_seconds(whole) is None:
         return None
     try:
-        local = datetime.datetime.fromisoformat(whole + offset)
+        local = parse_iso8601(whole + offset)
         utc = local.astimezone(datetime.timezone.utc)
     except (ValueError, OverflowError):
         return None
@@ -751,10 +773,8 @@ def _warn_if_empty_result(user_count_total: Optional[int], grant_objects: list[d
 
 
 def _parse_window_bound(flag: str, value: str):
-    import datetime
-
     try:
-        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = parse_iso8601(value)
     except ValueError as exc:
         raise ExportError(f"{flag} '{value}' is not an ISO-8601 timestamp") from exc
     if parsed.tzinfo is None:
