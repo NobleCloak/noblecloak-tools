@@ -11,6 +11,9 @@ script must produce, and fixtures/ for golden input/output pairs.
 
 This script performs no network I/O. It only reads the local files named
 on the command line and writes to --out-dir.
+
+Requires Python 3.9 or newer (the standard library only). macOS's built-in
+python3 is 3.9.
 """
 from __future__ import annotations
 
@@ -244,6 +247,31 @@ _UTC_Z_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z", re.ASC
 _OFFSET_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2})", re.ASCII)
 
 
+_FRACTION_RE = re.compile(r"(T\d{2}:\d{2}:\d{2})\.(\d+)", re.ASCII)
+
+
+def _fromisoformat(value: str) -> "datetime.datetime":
+    import datetime
+
+    return datetime.datetime.fromisoformat(value)
+
+
+def parse_iso8601(value: str) -> "datetime.datetime":
+    """Normalise `Z` and the fraction length, then call `fromisoformat`.
+
+    `datetime.fromisoformat` before 3.11 takes only 3- or 6-digit fractional
+    seconds and no `Z`. So `Z` becomes `+00:00` and the fraction is padded or
+    truncated (never rounded) to 6 digits. This is all it does: what else
+    `fromisoformat` accepts still depends on the Python version. The accepted
+    set is fixed by the regexes in to_utc_z, which every caller goes through
+    first. Raises ValueError for anything `fromisoformat` rejects.
+    """
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    value = _FRACTION_RE.sub(lambda m: m.group(1) + "." + m.group(2)[:6].ljust(6, "0"), value, count=1)
+    return _fromisoformat(value)
+
+
 def _parse_whole_seconds(whole: str):
     """Calendar-check YYYY-MM-DDTHH:MM:SS; returns a naive datetime or None."""
     import datetime
@@ -292,7 +320,8 @@ def to_utc_z(value: str) -> Optional[str]:
     if _parse_whole_seconds(whole) is None:
         return None
     try:
-        local = datetime.datetime.fromisoformat(whole + offset)
+        # `whole` has no fraction (kept aside in `fraction` and re-attached below).
+        local = parse_iso8601(whole + offset)
         utc = local.astimezone(datetime.timezone.utc)
     except (ValueError, OverflowError):
         return None
@@ -750,16 +779,22 @@ def _warn_if_empty_result(user_count_total: Optional[int], grant_objects: list[d
 # ---------------------------------------------------------------------------
 
 
-def _parse_window_bound(flag: str, value: str):
-    import datetime
+_NAIVE_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?", re.ASCII)
 
-    try:
-        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ExportError(f"{flag} '{value}' is not an ISO-8601 timestamp") from exc
-    if parsed.tzinfo is None:
+
+def _window_bound_utc(flag: str, value: str) -> str:
+    """Return a window flag as a UTC `Z` timestamp, or raise ExportError.
+
+    The accepted forms (and so the error wording) come from the to_utc_z
+    regexes, not from `fromisoformat`, so they are the same on every Python.
+    """
+    naive = _NAIVE_TS_RE.fullmatch(value.strip())
+    if naive is not None and _parse_whole_seconds(naive.group(1)) is not None:
         raise ExportError(f"{flag} '{value}' needs a UTC offset (e.g. 'Z' or '-05:00')")
-    return parsed
+    utc = to_utc_z(value)
+    if utc is None:
+        raise ExportError(f"{flag} '{value}' is not an ISO-8601 timestamp")
+    return utc
 
 
 def resolve_export_window(start: Optional[str], end: Optional[str]) -> Optional[dict]:
@@ -775,11 +810,11 @@ def resolve_export_window(start: Optional[str], end: Optional[str]) -> Optional[
         return None
     if start is None or end is None:
         raise ExportError("--export-window-start and --export-window-end must be given both or neither")
-    if _parse_window_bound("--export-window-start", start) > _parse_window_bound("--export-window-end", end):
+    start_utc = _window_bound_utc("--export-window-start", start)
+    end_utc = _window_bound_utc("--export-window-end", end)
+    # Exact comparison: fractions longer than 6 digits must not be truncated away.
+    if utc_instant_key(start_utc) > utc_instant_key(end_utc):
         raise ExportError(f"--export-window-start '{start}' is after --export-window-end '{end}'")
-    start_utc, end_utc = to_utc_z(start), to_utc_z(end)
-    if start_utc is None or end_utc is None:
-        raise ExportError("--export-window-start / --export-window-end must be YYYY-MM-DDTHH:MM:SS with an offset")
     return {"start": start_utc, "end": end_utc}
 
 
