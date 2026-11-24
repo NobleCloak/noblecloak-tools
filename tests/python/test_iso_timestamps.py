@@ -5,7 +5,9 @@ seconds and no `Z` suffix. The script routes every timestamp parse through
 `parse_iso8601`, which normalises first. These tests pin that.
 """
 import datetime
+import re
 import unittest
+from unittest import mock
 
 from _load_nc_export import load_nc_export
 
@@ -15,7 +17,31 @@ UTC = datetime.timezone.utc
 EST = datetime.timezone(datetime.timedelta(hours=-5))
 
 
+_STRICT_39_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.(\d{3}|\d{6}))?([+-]\d{2}:\d{2})?", re.ASCII
+)
+
+
+def strict_39_fromisoformat(value):
+    """Stand-in for Python 3.9's fromisoformat: 3 or 6 fraction digits, no `Z`."""
+    if _STRICT_39_RE.fullmatch(value) is None:
+        raise ValueError(f"Invalid isoformat string: {value!r}")
+    return datetime.datetime.fromisoformat(value)
+
+
 class TestParseIso8601(unittest.TestCase):
+    """Runs against a strict 3.9-style fromisoformat, so a 3.11+ job catches a regression too."""
+
+    def setUp(self):
+        patcher = mock.patch.object(nc, "_fromisoformat", strict_39_fromisoformat)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_stub_rejects_what_python_39_rejects(self):
+        for text in ("2026-01-05T10:00:00.5+00:00", "2026-01-05T10:00:00Z", "2026-01-05T10:00:00.1234567+00:00"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                strict_39_fromisoformat(text)
+
     def test_fraction_lengths(self):
         cases = {
             "": 0,
@@ -58,6 +84,8 @@ class TestParseIso8601(unittest.TestCase):
 
 
 class TestWindowBoundAndUtcConversion(unittest.TestCase):
+    END = "2026-12-01T00:00:00Z"
+
     def test_window_bound_accepts_any_fraction_length_and_z(self):
         for text in (
             "2026-11-18T23:59:59.5-05:00",
@@ -66,18 +94,48 @@ class TestWindowBoundAndUtcConversion(unittest.TestCase):
             "2026-11-18T23:59:59Z",
         ):
             with self.subTest(text=text):
-                self.assertIsNotNone(nc._parse_window_bound("--export-window-end", text).tzinfo)
+                self.assertTrue(nc._window_bound_utc("--export-window-end", text).endswith("Z"))
 
-    def test_window_bound_errors_are_unchanged(self):
+    def test_window_bound_errors(self):
         with self.assertRaisesRegex(nc.ExportError, "is not an ISO-8601 timestamp"):
-            nc._parse_window_bound("--export-window-end", "last tuesday")
-        with self.assertRaisesRegex(nc.ExportError, "needs a UTC offset"):
-            nc._parse_window_bound("--export-window-end", "2026-11-18T23:59:59.5")
+            nc.resolve_export_window("last tuesday", self.END)
+        for naive in ("2026-11-18T23:59:59.5", "2026-11-18T23:59:59"):
+            with self.subTest(naive=naive), self.assertRaisesRegex(nc.ExportError, "needs a UTC offset"):
+                nc.resolve_export_window(naive, self.END)
 
-    def test_window_bound_is_ordered_across_fraction_lengths(self):
-        early = nc._parse_window_bound("s", "2026-11-18T00:00:00.1234567Z")
-        late = nc._parse_window_bound("e", "2026-11-18T00:00:00.5Z")
-        self.assertLess(early, late)
+    def test_forms_outside_the_regexes_are_rejected_the_same_everywhere(self):
+        # Newer Pythons' fromisoformat accepts some of these; the script must not.
+        for text in (
+            "2026-11-18T10:00:00-0500",
+            "2026-11-18 10:00:00Z",
+            "2026-11-18T10:00:00z",
+            "2026-11-18T10:00:00,5Z",
+            "2026-11-18T10:00:00ZZ",
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(nc.ExportError, "is not an ISO-8601 timestamp"):
+                nc.resolve_export_window(text, self.END)
+
+    def test_window_is_ordered_across_fraction_lengths(self):
+        self.assertEqual(
+            nc.resolve_export_window("2026-11-18T00:00:00.1234567Z", "2026-11-18T00:00:00.5Z"),
+            {"start": "2026-11-18T00:00:00.1234567Z", "end": "2026-11-18T00:00:00.5Z"},
+        )
+
+    def test_sub_microsecond_inversion_is_rejected(self):
+        cases = [
+            ("2026-11-18T00:00:00.1234567Z", "2026-11-18T00:00:00.1234561Z"),
+            # Mixed offsets: 10:00:00.1234567-05:00 is 15:00:00.1234567Z.
+            ("2026-11-18T10:00:00.1234567-05:00", "2026-11-18T15:00:00.1234561Z"),
+            ("2026-11-18T15:00:00.1234567Z", "2026-11-18T10:00:00.1234561-05:00"),
+        ]
+        for start, end in cases:
+            with self.subTest(start=start, end=end), self.assertRaisesRegex(nc.ExportError, "is after"):
+                nc.resolve_export_window(start, end)
+
+    def test_equal_instants_are_accepted(self):
+        self.assertIsNotNone(
+            nc.resolve_export_window("2026-11-18T10:00:00.1234567-05:00", "2026-11-18T15:00:00.1234567Z")
+        )
 
     def test_resolve_export_window_with_odd_fractions(self):
         self.assertEqual(

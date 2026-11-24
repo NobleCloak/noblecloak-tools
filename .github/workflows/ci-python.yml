@@ -13,8 +13,11 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.x"]
         include:
-          # Oldest supported Python (macOS's built-in python3 is 3.9).
-          - os: ubuntu-latest
+          # Oldest supported Python (macOS's built-in python3 is 3.9). Pinned to
+          # 24.04 because setup-python has no 3.9 build for ubuntu-latest (26.04).
+          # When 24.04 runners retire, move this job to `container: python:3.9-slim`
+          # or install 3.9 with uv.
+          - os: ubuntu-24.04
             python-version: "3.9"
     runs-on: ${{ matrix.os }}
     steps:
